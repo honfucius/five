@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>五子棋 正統規則對戰（降維打擊 1D 陣列版）</title>
+<title>五子棋 正統規則對戰（LUT 查表極速版）</title>
 <style>
 body { margin:0; font-family:'Segoe UI',sans-serif; text-align:center; display:flex; flex-direction:column; align-items:center; padding:20px; background:linear-gradient(to bottom,#f8f8f8,#e0e0e0); position: relative; min-height: 100vh; }
 h2 { font-size:2em; margin:10px 0; color:#222; text-shadow:1px 1px 2px #aaa; }
@@ -51,7 +51,7 @@ button:disabled { background-color: #999; cursor: not-allowed; }
     <input type="number" id="depthInput" value="8" min="1" max="15" onchange="updateDepth()">
 </div>
 
-<h2>🎯 正統五子棋（降維打擊 1D 陣列版）</h2>
+<h2>🎯 正統五子棋（LUT 查表極速版）</h2>
 <div id="status">請黑棋先手落子 (第一手必須在正中央)</div>
 <div id="coreInfo"></div>
 
@@ -75,23 +75,118 @@ button:disabled { background-color: #999; cursor: not-allowed; }
 <div class="rules">
 <h3>📝 系統與規則說明</h3>
 <ul>
-<li><strong>降維打擊：</strong>底層改用 `Uint8Array` 搭配 1D 連續記憶體，大幅提升 CPU Cache 快取命中率與多核心資料複製速度。</li>
-<li><strong>全域同步剪枝：</strong>保留所有死三防禦修正，並使用 Atomics 共享記憶體進行跨核心平行剪枝。</li>
-<li><strong>伺服器限定：</strong>啟用共享記憶體需 COOP/COEP 環境，否則將自動安全降級為單核處理。</li>
+<li><strong>O(1) 查表法加速：</strong>徹底拔除耗效能的正則表達式，採用 729 狀態的 Base-3 滑動視窗 (Sliding Window) 查表技術。</li>
+<li><strong>極致快取命中：</strong>結合 1D TypedArray 與 0記憶體分配 (Zero-Allocation) 掃描，將效能推至 JavaScript 的物理極限。</li>
+<li><strong>伺服器限定：</strong>多核共享記憶體需 COOP/COEP 環境，否則降為單核處理。</li>
 </ul>
 </div>
 
-<!-- ================= Web Worker 核心邏輯 ================= -->
-<script id="aiWorkerCode" type="javascript/worker">
+<!-- ================= 核心 AI 與 LUT 運算邏輯 (共享給 Main 與 Worker) ================= -->
+<script id="aiCoreCode">
 const size = 15;
 const SCORE_WIN = 10000000;
 const SCORE_ALIVE_4 = 100000;
 const SCORE_DEAD_4 = 10000;
-const SCORE_ALIVE_3 = 1000;
-const SCORE_DEAD_3 = 100;
-const SCORE_ALIVE_2 = 10;
 const MIN_INF = -100000000;
 const MAX_INF = 100000000;
+
+// LUT 表
+const lutMyTurn = new Int32Array(729);
+const lutNotMyTurn = new Int32Array(729);
+const lutAlive3 = new Uint8Array(729);
+const lutFours = new Uint8Array(729);
+const lutThrees = new Uint8Array(729);
+
+// 預編譯 O(1) 查表法陣列
+function initLUT() {
+    for (let i = 0; i < 729; i++) {
+        let val = i;
+        let str = '';
+        for (let j = 0; j < 6; j++) {
+            str += (val % 3);
+            val = (val / 3) | 0;
+        }
+        
+        let scoreMyTurn = 0, scoreNotMyTurn = 0;
+        let isAlive3 = 0, isFour = 0, isThreeForbidden = 0;
+        
+        if (str.startsWith('11111')) {
+            scoreMyTurn += 500000; scoreNotMyTurn += 500000;
+        } else if (str === '011110') {
+            scoreMyTurn += 500000; scoreNotMyTurn += 100000; isFour = 1;
+        } else if (str === '211110' || str === '011112' || str.startsWith('10111') || str.startsWith('11011') || str.startsWith('11101')) {
+            scoreMyTurn += 500000; scoreNotMyTurn += 10000; isFour = 1;
+        }
+        
+        if (str === '011100' || str === '001110' || str === '010110' || str === '011010') {
+            scoreMyTurn += 1000; scoreNotMyTurn += 1000; isAlive3 = 1; isThreeForbidden = 1;
+        } else if (str === '211100' || str === '001112' || str === '210110' || str === '011012' || str === '010112' || str === '211010' || str.startsWith('10011') || str.startsWith('11001') || str === '201110' || str === '011102' || str.startsWith('10101')) {
+            scoreMyTurn += 100; scoreNotMyTurn += 100;
+        } else if (str === '001100' || str.startsWith('01010') || str === '010010') {
+            scoreMyTurn += 10; scoreNotMyTurn += 10;
+        }
+        
+        lutMyTurn[i] = scoreMyTurn;
+        lutNotMyTurn[i] = scoreNotMyTurn;
+        lutAlive3[i] = isAlive3;
+        lutFours[i] = isFour;
+        lutThrees[i] = isThreeForbidden;
+    }
+}
+initLUT();
+
+// 零記憶體分配 (Zero-Allocation) 全域變數
+const lineArr = new Uint8Array(17);
+let retScore = 0, retAlive3 = 0, retFours = 0, retThrees = 0;
+
+// O(1) 滑動視窗評分函數
+function evaluateDirection(tempBoard, startX, startY, dx, dy, player, isMyTurn) {
+    const lut = isMyTurn ? lutMyTurn : lutNotMyTurn;
+    let len = 0;
+    lineArr[len++] = 2; // 邊界牆
+    let x = startX, y = startY;
+    while (x >= 0 && x < size && y >= 0 && y < size) {
+        let p = tempBoard[x + y * size];
+        lineArr[len++] = (p === 0) ? 0 : (p === player ? 1 : 2);
+        x += dx; y += dy;
+    }
+    lineArr[len++] = 2; // 邊界牆
+    
+    retScore = 0; retAlive3 = 0;
+    if (len < 6) return;
+    
+    let hash = lineArr[0] + lineArr[1]*3 + lineArr[2]*9 + lineArr[3]*27 + lineArr[4]*81;
+    for (let i = 5; i < len; i++) {
+        hash += lineArr[i] * 243;
+        retScore += lut[hash];
+        retAlive3 += lutAlive3[hash];
+        hash = (hash / 3) | 0; // 高速向右滑動
+    }
+}
+
+// 專為禁手判斷設計的極速滑動視窗
+function evaluateDirectionForbidden(tempBoard, startX, startY, dx, dy) {
+    let len = 0;
+    lineArr[len++] = 2; 
+    let x = startX, y = startY;
+    while (x >= 0 && x < size && y >= 0 && y < size) {
+        let p = tempBoard[x + y * size];
+        lineArr[len++] = (p === 0) ? 0 : (p === 1 ? 1 : 2);
+        x += dx; y += dy;
+    }
+    lineArr[len++] = 2; 
+    
+    retFours = 0; retThrees = 0;
+    if (len < 6) return;
+    
+    let hash = lineArr[0] + lineArr[1]*3 + lineArr[2]*9 + lineArr[3]*27 + lineArr[4]*81;
+    for (let i = 5; i < len; i++) {
+        hash += lineArr[i] * 243;
+        retFours += lutFours[hash];
+        retThrees += lutThrees[hash];
+        hash = (hash / 3) | 0;
+    }
+}
 
 function checkWin(tempBoard, x, y, p) {
     const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
@@ -113,18 +208,6 @@ function checkWin(tempBoard, x, y, p) {
     return false;
 }
 
-function getLineStringForForbidden(tempBoard, x, y, dx, dy) {
-    let str = "";
-    for (let i = -5; i <= 5; i++) {
-        const nx = x + dx * i, ny = y + dy * i;
-        if (nx < 0 || ny < 0 || nx >= size || ny >= size) str += "2"; 
-        else if (tempBoard[nx + ny * size] === 2) str += "2"; 
-        else if (tempBoard[nx + ny * size] === 1) str += "1"; 
-        else str += "0"; 
-    }
-    return str;
-}
-
 function checkOverline(tempBoard, x, y) {
     const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
     for (const d of dirs) {
@@ -144,149 +227,74 @@ function checkOverline(tempBoard, x, y) {
     return false;
 }
 
-function checkForbidden(tempBoard, x, y) {
-    let original = tempBoard[x + y * size];
-    tempBoard[x + y * size] = 1; 
-    if (checkOverline(tempBoard, x, y)) { tempBoard[x + y * size] = original; return "長連"; }
+function checkForbidden(tempBoard, px, py) {
+    let original = tempBoard[px + py * size];
+    tempBoard[px + py * size] = 1; 
+    if (checkOverline(tempBoard, px, py)) { tempBoard[px + py * size] = original; return "長連"; }
+    
     let fours = 0, threes = 0;
-    const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
-    for (const d of dirs) {
-        const line = getLineStringForForbidden(tempBoard, x, y, d.dx, d.dy);
-        if (/(011110|211110|011112|10111|11011|11101)/.test(line)) fours++;
-        if (/(011100|001110|010110|011010)/.test(line)) threes++;
+    let d1_min = Math.min(px, py), d2_min = Math.min(px, size - 1 - py);
+    let lines = [
+        [0, py, 1, 0], [px, 0, 0, 1], 
+        [px - d1_min, py - d1_min, 1, 1], [px - d2_min, py + d2_min, 1, -1] 
+    ];
+    
+    for (let [sx, sy, dx, dy] of lines) {
+        evaluateDirectionForbidden(tempBoard, sx, sy, dx, dy);
+        fours += retFours; threes += retThrees;
     }
-    tempBoard[x + y * size] = original; 
+    
+    tempBoard[px + py * size] = original; 
     if (fours >= 2) return "雙四";
     if (threes >= 2) return "雙三";
     return null;
 }
 
-// 將二維轉一維後的高速字串擷取
-function getAllLines(tempBoard) {
-    let lines = [];
-    // 橫向
-    for (let y = 0; y < size; y++) {
-        let str = '3';
-        for (let x = 0; x < size; x++) str += tempBoard[x + y * size];
-        lines.push(str + '3');
-    }
-    // 直向
-    for (let x = 0; x < size; x++) {
-        let str = '3';
-        for (let y = 0; y < size; y++) str += tempBoard[x + y * size];
-        lines.push(str + '3');
-    }
-    // 斜向 (\)
-    for (let k = -size + 1; k < size; k++) {
-        let diag = '3';
-        for (let x = 0; x < size; x++) {
-            let y = x - k;
-            if (y >= 0 && y < size) diag += tempBoard[x + y * size];
-        }
-        if (diag.length > 6) lines.push(diag + '3'); 
-    }
-    // 斜向 (/)
-    for (let k = 0; k < size * 2 - 1; k++) {
-        let diag = '3';
-        for (let x = 0; x < size; x++) {
-            let y = k - x;
-            if (y >= 0 && y < size) diag += tempBoard[x + y * size];
-        }
-        if (diag.length > 6) lines.push(diag + '3');
-    }
-    return lines;
-}
-
-function getIntersectingLines(tempBoard, px, py) {
-    let lines = [];
-    let str = '3';
-    for (let x = 0; x < size; x++) str += tempBoard[x + py * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    for (let y = 0; y < size; y++) str += tempBoard[px + y * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    let min1 = Math.min(px, py);
-    for(let x=px-min1, y=py-min1; x<size && y<size; x++, y++) str += tempBoard[x + y * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    let min2 = Math.min(px, size - 1 - py);
-    for(let x=px-min2, y=py+min2; x<size && y>=0; x++, y--) str += tempBoard[x + y * size];
-    lines.push(str + '3');
-    
-    return lines;
-}
-
-function evaluateLineString(s, p, isMyTurn) {
-    let score = 0;
-    let str = p === 1 ? s : s.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-    str = str.replace(/3/g, '2'); 
-    
-    if (str.includes("11111")) return 500000;
-    if (str.includes("011110")) {
-        if (isMyTurn) return 500000;
-        score += SCORE_ALIVE_4;
-    } else if (/(211110|011112|10111|11011|11101)/.test(str)) {
-        if (isMyTurn) return 500000; 
-        score += SCORE_DEAD_4;
-    }
-    
-    if (/(011100|001110|010110|011010)/.test(str)) score += SCORE_ALIVE_3;
-    else if (/(211100|001112|210110|011012|010112|211010|10011|11001|201110|011102|10101)/.test(str)) score += SCORE_DEAD_3;
-    
-    if (/(001100|01010|010010)/.test(str)) score += SCORE_ALIVE_2;
-    return score;
-}
-
 function evaluateBoard(tempBoard, isMaximizing, aiPlayerId) {
-    let aiScore = 0;
-    let humanScore = 0;
+    let aiScore = 0, aiAlive3Count = 0;
+    let humanScore = 0, humanAlive3Count = 0;
     let opponentId = 3 - aiPlayerId;
-    let lines = getAllLines(tempBoard);
-    let aiAlive3Count = 0;
-    let humanAlive3Count = 0;
 
-    for (let line of lines) {
-        let aiStr = aiPlayerId === 1 ? line : line.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        aiStr = aiStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(aiStr)) aiAlive3Count++;
-        aiScore += evaluateLineString(line, aiPlayerId, isMaximizing);
-
-        let humStr = opponentId === 1 ? line : line.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        humStr = humStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(humStr)) humanAlive3Count++;
-        humanScore += evaluateLineString(line, opponentId, !isMaximizing);
+    function processLine(sx, sy, dx, dy) {
+        evaluateDirection(tempBoard, sx, sy, dx, dy, aiPlayerId, isMaximizing);
+        aiScore += retScore; aiAlive3Count += retAlive3;
+        evaluateDirection(tempBoard, sx, sy, dx, dy, opponentId, !isMaximizing);
+        humanScore += retScore; humanAlive3Count += retAlive3;
     }
+
+    for (let y = 0; y < size; y++) processLine(0, y, 1, 0);
+    for (let x = 0; x < size; x++) processLine(x, 0, 0, 1);
+    for (let k = -size + 1; k < size; k++) processLine(Math.max(0, k), Math.max(0, -k), 1, 1);
+    for (let k = 0; k < size * 2 - 1; k++) processLine(Math.max(0, k - size + 1), Math.min(size - 1, k), 1, -1);
+
     if (aiAlive3Count >= 2) aiScore += SCORE_ALIVE_4;
     if (humanAlive3Count >= 2) humanScore += SCORE_ALIVE_4;
     return aiScore - (humanScore * 2.0); 
 }
 
-function evaluateMoveImpact(tempBoard, x, y, aiPlayerId) {
+function evaluateMoveImpact(tempBoard, px, py, aiPlayerId) {
     let opponentId = 3 - aiPlayerId;
+    let d1_min = Math.min(px, py), d2_min = Math.min(px, size - 1 - py);
+    let lines = [
+        [0, py, 1, 0], [px, 0, 0, 1], 
+        [px - d1_min, py - d1_min, 1, 1], [px - d2_min, py + d2_min, 1, -1] 
+    ];
     
-    tempBoard[x + y * size] = aiPlayerId; 
+    tempBoard[px + py * size] = aiPlayerId; 
     let aiScore = 0, aiAlive3 = 0;
-    for (let l of getIntersectingLines(tempBoard, x, y)) {
-        let aiStr = aiPlayerId === 1 ? l : l.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        aiStr = aiStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(aiStr)) aiAlive3++;
-        aiScore += evaluateLineString(l, aiPlayerId, false);
+    for (let [sx, sy, dx, dy] of lines) {
+        evaluateDirection(tempBoard, sx, sy, dx, dy, aiPlayerId, false);
+        aiScore += retScore; aiAlive3 += retAlive3;
     }
     
-    tempBoard[x + y * size] = opponentId; 
+    tempBoard[px + py * size] = opponentId; 
     let humanScore = 0, humanAlive3 = 0;
-    for (let l of getIntersectingLines(tempBoard, x, y)) {
-        let humStr = opponentId === 1 ? l : l.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        humStr = humStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(humStr)) humanAlive3++;
-        humanScore += evaluateLineString(l, opponentId, false);
+    for (let [sx, sy, dx, dy] of lines) {
+        evaluateDirection(tempBoard, sx, sy, dx, dy, opponentId, false);
+        humanScore += retScore; humanAlive3 += retAlive3;
     }
     
-    tempBoard[x + y * size] = 0; 
+    tempBoard[px + py * size] = 0; 
     if (aiAlive3 >= 2) aiScore += SCORE_ALIVE_4;
     if (humanAlive3 >= 2) humanScore += SCORE_ALIVE_4;
     return aiScore + humanScore; 
@@ -313,7 +321,7 @@ function generateCandidateMoves(currentBoard, aiPlayerId) {
         }
     }
     if (!hasStone) return [{x:7, y:7}];
-    return moves.sort((a, b) => b.score - a.score).slice(0, 8);
+    return moves.sort((a, b) => b.score - a.score).slice(0, 10);
 }
 
 function minimax(tempBoard, depth, alpha, beta, isMaximizing, lastX, lastY, aiPlayerId) {
@@ -355,15 +363,16 @@ function minimax(tempBoard, depth, alpha, beta, isMaximizing, lastX, lastY, aiPl
         return minEval === MAX_INF ? evaluateBoard(tempBoard, isMaximizing, aiPlayerId) : minEval;
     }
 }
+</script>
 
+<!-- Web Worker 包裝層 -->
+<script id="aiWorkerWrapper" type="javascript/worker">
 self.onmessage = function(e) {
     const { boardData, moves, depth, aiPlayerId, sharedBuffer } = e.data;
-    const board = new Uint8Array(boardData); // 1D TypedArray 拷貝，速度極快
+    const board = new Uint8Array(boardData); 
     
     let sharedAlpha = null;
-    if (sharedBuffer) {
-        sharedAlpha = new Int32Array(sharedBuffer);
-    }
+    if (sharedBuffer) sharedAlpha = new Int32Array(sharedBuffer);
 
     let bestMove = null;
     let maxEval = MIN_INF;
@@ -402,6 +411,9 @@ self.onmessage = function(e) {
 <!-- =============================================================== -->
 
 <script>
+// 動態載入核心函數，避免重複代碼
+eval(document.getElementById('aiCoreCode').textContent);
+
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
 const statusDiv = document.getElementById('status');
@@ -410,20 +422,17 @@ const modeSelect = document.getElementById('modeSelect');
 const progressContainer = document.getElementById('progressContainer');
 const progressBar = document.getElementById('progressBar');
 const depthInput = document.getElementById('depthInput');
-const size = 15;
-const cellSize = canvas.width / size;
 
 let hasSharedMemory = typeof SharedArrayBuffer !== 'undefined';
 const maxCores = navigator.hardwareConcurrency || 4;
 
 if (hasSharedMemory) {
-    coreInfoDiv.textContent = `⚡ Atomics 同步啟動：1D 降維打擊，滿血調用 ${maxCores} 核心`;
+    coreInfoDiv.textContent = `⚡ Atomics 極速版：LUT O(1) 查表 + 滿血 ${maxCores} 核平行處理`;
 } else {
     coreInfoDiv.style.color = "#d93025";
-    coreInfoDiv.innerHTML = `⚠️ 伺服器無 COOP/COEP 標頭，使用 1D 降維陣列 + 單核安全模式。`;
+    coreInfoDiv.innerHTML = `⚠️ 無 COOP/COEP 標頭：已套用 LUT 查表但退回單核安全模式。`;
 }
 
-// 主棋盤改用 1D 的 TypedArray
 let board = new Uint8Array(size * size);
 let history = [];
 let currentPlayer = 1; 
@@ -445,7 +454,7 @@ function updateDepth() {
 }
 
 function init() {
-    board = new Uint8Array(size * size); // 清空 1D 陣列
+    board = new Uint8Array(size * size); 
     history = [];
     gameOver = false;
     currentPlayer = 1;
@@ -536,141 +545,6 @@ canvas.addEventListener('click', e => {
     processMove(x, y);
 });
 
-const SCORE_WIN = 10000000;
-const SCORE_ALIVE_4 = 100000;
-
-// 主執行緒也改成 1D 版本
-function checkWinMain(tempBoard, x, y, p) {
-    const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
-    for (const d of dirs) {
-        let count = 1;
-        for (let i = 1; i <= 5; i++) {
-            const nx = x + d.dx * i, ny = y + d.dy * i;
-            if (nx < 0 || ny < 0 || nx >= size || ny >= size || tempBoard[nx + ny * size] !== p) break;
-            count++;
-        }
-        for (let i = 1; i <= 5; i++) {
-            const nx = x - d.dx * i, ny = y - d.dy * i;
-            if (nx < 0 || ny < 0 || nx >= size || ny >= size || tempBoard[nx + ny * size] !== p) break;
-            count++;
-        }
-        if (p === 1 && count === 5) return true;
-        if (p === 2 && count >= 5) return true;
-    }
-    return false;
-}
-
-function checkOverlineMain(tempBoard, x, y) {
-    const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
-    for (const d of dirs) {
-        let count = 1;
-        for (let i = 1; i <= 6; i++) {
-            const nx = x + d.dx * i, ny = y + d.dy * i;
-            if (nx < 0 || ny < 0 || nx >= size || ny >= size || tempBoard[nx + ny * size] !== 1) break;
-            count++;
-        }
-        for (let i = 1; i <= 6; i++) {
-            const nx = x - d.dx * i, ny = y - d.dy * i;
-            if (nx < 0 || ny < 0 || nx >= size || ny >= size || tempBoard[nx + ny * size] !== 1) break;
-            count++;
-        }
-        if (count > 5) return true; 
-    }
-    return false;
-}
-
-function checkForbiddenMain(tempBoard, x, y) {
-    let original = tempBoard[x + y * size];
-    tempBoard[x + y * size] = 1; 
-    if (checkOverlineMain(tempBoard, x, y)) { tempBoard[x + y * size] = original; return "長連"; }
-    let fours = 0, threes = 0;
-    const dirs = [{dx:1, dy:0}, {dx:0, dy:1}, {dx:1, dy:1}, {dx:1, dy:-1}];
-    for (const d of dirs) {
-        let str = "";
-        for (let i = -5; i <= 5; i++) {
-            const nx = x + d.dx * i, ny = y + d.dy * i;
-            if (nx < 0 || ny < 0 || nx >= size || ny >= size) str += "2"; 
-            else if (tempBoard[nx + ny * size] === 2) str += "2"; 
-            else if (tempBoard[nx + ny * size] === 1) str += "1"; 
-            else str += "0"; 
-        }
-        if (/(011110|211110|011112|10111|11011|11101)/.test(str)) fours++;
-        if (/(011100|001110|010110|011010)/.test(str)) threes++;
-    }
-    tempBoard[x + y * size] = original; 
-    if (fours >= 2) return "雙四";
-    if (threes >= 2) return "雙三";
-    return null;
-}
-
-function getIntersectingLinesMain(tempBoard, px, py) {
-    let lines = [];
-    let str = '3';
-    for (let x = 0; x < size; x++) str += tempBoard[x + py * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    for (let y = 0; y < size; y++) str += tempBoard[px + y * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    let min1 = Math.min(px, py);
-    for(let x=px-min1, y=py-min1; x<size && y<size; x++, y++) str += tempBoard[x + y * size];
-    lines.push(str + '3');
-    
-    str = '3';
-    let min2 = Math.min(px, size - 1 - py);
-    for(let x=px-min2, y=py+min2; x<size && y>=0; x++, y--) str += tempBoard[x + y * size];
-    lines.push(str + '3');
-    
-    return lines;
-}
-
-function evaluateLineStringMain(s, p, isMyTurn) {
-    let score = 0;
-    let str = p === 1 ? s : s.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-    str = str.replace(/3/g, '2'); 
-    
-    if (str.includes("11111")) return 500000;
-    if (str.includes("011110")) {
-        if (isMyTurn) return 500000;
-        score += 100000;
-    } else if (/(211110|011112|10111|11011|11101)/.test(str)) {
-        if (isMyTurn) return 500000; 
-        score += 10000;
-    }
-    
-    if (/(011100|001110|010110|011010)/.test(str)) score += 1000;
-    else if (/(211100|001112|210110|011012|010112|211010|10011|11001|201110|011102|10101)/.test(str)) score += 100;
-    
-    if (/(001100|01010|010010)/.test(str)) score += 10;
-    return score;
-}
-
-function evaluateMoveImpactMain(tempBoard, x, y, aiPlayerId) {
-    let opponentId = 3 - aiPlayerId;
-    tempBoard[x + y * size] = aiPlayerId; 
-    let aiScore = 0, aiAlive3 = 0;
-    for (let l of getIntersectingLinesMain(tempBoard, x, y)) {
-        let aiStr = aiPlayerId === 1 ? l : l.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        aiStr = aiStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(aiStr)) aiAlive3++;
-        aiScore += evaluateLineStringMain(l, aiPlayerId, false);
-    }
-    tempBoard[x + y * size] = opponentId; 
-    let humanScore = 0, humanAlive3 = 0;
-    for (let l of getIntersectingLinesMain(tempBoard, x, y)) {
-        let humStr = opponentId === 1 ? l : l.replace(/1/g, 'x').replace(/2/g, '1').replace(/x/g, '2');
-        humStr = humStr.replace(/3/g, '2');
-        if (/(011100|001110|010110|011010)/.test(humStr)) humanAlive3++;
-        humanScore += evaluateLineStringMain(l, opponentId, false);
-    }
-    tempBoard[x + y * size] = 0; 
-    if (aiAlive3 >= 2) aiScore += SCORE_ALIVE_4;
-    if (humanAlive3 >= 2) humanScore += SCORE_ALIVE_4;
-    return aiScore + humanScore; 
-}
-
 function processMove(x, y) {
     if (x < 0 || x >= size || y < 0 || y >= size || board[x + y * size] !== 0) return false;
     
@@ -683,10 +557,10 @@ function processMove(x, y) {
     }
     board[x + y * size] = currentPlayer;
     if (currentPlayer === 1) {
-        if (checkWinMain(board, x, y, 1)) {
+        if (checkWin(board, x, y, 1)) {
             history.push({x, y}); finishGame("⚫ 黑棋 獲勝！"); return true;
         }
-        const forbidden = checkForbiddenMain(board, x, y);
+        const forbidden = checkForbidden(board, x, y);
         if (forbidden) {
             board[x + y * size] = 0; 
             if (!isAIThinking) {
@@ -696,7 +570,7 @@ function processMove(x, y) {
             return false;
         }
     } else {
-        if (checkWinMain(board, x, y, 2)) {
+        if (checkWin(board, x, y, 2)) {
             history.push({x, y}); finishGame("⚪ 白棋 獲勝！"); return true;
         }
     }
@@ -721,30 +595,6 @@ function checkTurn() {
     if (isAITurn) triggerAIWorker();
 }
 
-function generateCandidatesMain(aiPlayerId) {
-    let moves = [];
-    let hasStone = false;
-    for (let x = 0; x < size; x++) {
-        for (let y = 0; y < size; y++) {
-            if (board[x + y * size] !== 0) { hasStone = true; continue; }
-            let isNear = false;
-            for(let dx = -2; dx <= 2; dx++){
-                for(let dy = -2; dy <= 2; dy++){
-                    if(dx===0 && dy===0) continue;
-                    let nx = x + dx, ny = y + dy;
-                    if(nx>=0 && nx<size && ny>=0 && ny<size && board[nx + ny * size] !== 0) {
-                        isNear = true; break;
-                    }
-                }
-                if(isNear) break;
-            }
-            if (isNear) moves.push({x: x, y: y, score: evaluateMoveImpactMain(board, x, y, aiPlayerId)});
-        }
-    }
-    if (!hasStone) return [{x:7, y:7}];
-    return moves.sort((a, b) => b.score - a.score).slice(0, 24); 
-}
-
 function triggerAIWorker() {
     isAIThinking = true;
     document.getElementById('undoBtn').disabled = true;
@@ -753,25 +603,25 @@ function triggerAIWorker() {
     updateDepth(); 
     
     statusDiv.style.color = "#1e8e3e";
-    statusDiv.textContent = `🤖 AI 多核平行演算中 (深度 ${aiSearchDepth})...`;
+    statusDiv.textContent = `🤖 AI O(1) 極速演算中 (深度 ${aiSearchDepth})...`;
     
     let aiPlayerId = currentPlayer;
     let opponentId = 3 - aiPlayerId;
     
-    let candidates = generateCandidatesMain(aiPlayerId);
+    let candidates = generateCandidateMoves(board, aiPlayerId);
     if (aiPlayerId === 1) {
-        candidates = candidates.filter(m => !checkForbiddenMain(board, m.x, m.y));
+        candidates = candidates.filter(m => !checkForbidden(board, m.x, m.y));
     }
 
     for (let move of candidates) {
         board[move.x + move.y * size] = aiPlayerId;
-        if (checkWinMain(board, move.x, move.y, aiPlayerId)) { board[move.x + move.y * size] = 0; applyAIMove(move); return; }
+        if (checkWin(board, move.x, move.y, aiPlayerId)) { board[move.x + move.y * size] = 0; applyAIMove(move); return; }
         board[move.x + move.y * size] = 0;
     }
     let blockMove = null;
     for (let move of candidates) {
         board[move.x + move.y * size] = opponentId;
-        if (checkWinMain(board, move.x, move.y, opponentId)) { blockMove = move; }
+        if (checkWin(board, move.x, move.y, opponentId)) { blockMove = move; }
         board[move.x + move.y * size] = 0;
         if (blockMove) { applyAIMove(blockMove); return; }
     }
@@ -786,7 +636,9 @@ function triggerAIWorker() {
     totalMovesToProcess = candidates.length;
     processedMovesCount = 0;
     
-    const workerBlob = new Blob([document.getElementById('aiWorkerCode').textContent], { type: "text/javascript" });
+    // 合併核心邏輯與 Worker 封裝層
+    const fullWorkerCode = document.getElementById('aiCoreCode').textContent + "\n" + document.getElementById('aiWorkerWrapper').textContent;
+    const workerBlob = new Blob([fullWorkerCode], { type: "text/javascript" });
     const workerUrl = URL.createObjectURL(workerBlob);
 
     let sharedBuffer = null;
@@ -794,7 +646,7 @@ function triggerAIWorker() {
     if (hasSharedMemory) {
         sharedBuffer = new SharedArrayBuffer(4);
         const sharedData = new Int32Array(sharedBuffer);
-        sharedData[0] = -100000000;
+        sharedData[0] = MIN_INF;
         effectiveCores = maxCores;
     }
 
@@ -836,7 +688,7 @@ function triggerAIWorker() {
         };
 
         worker.postMessage({
-            boardData: board.buffer, // 直接傳遞 TypedArray 的底層 buffer
+            boardData: board.buffer, 
             moves: chunk,
             depth: aiSearchDepth,
             aiPlayerId: aiPlayerId,
