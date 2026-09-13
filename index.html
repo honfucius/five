@@ -473,7 +473,7 @@ let processedMovesCount = 0;
 function updateDepth() {
     let val = parseInt(depthInput.value);
     if (isNaN(val) || val < 1) val = 1;
-    if (val > 10) val = 10; 
+    if (val > 20) val = 20; 
     depthInput.value = val;
     aiSearchDepth = val;
 }
