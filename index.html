@@ -81,7 +81,7 @@ button:disabled { background-color: #999; cursor: not-allowed; }
 </ul>
 </div>
 
-<!-- ================= 核心 AI 與 LUT 運算邏輯 (共享給 Main 與 Worker) ================= -->
+<!-- ================= 核心 AI 與 LUT 運算邏輯 (主執行緒與 Worker 共用) ================= -->
 <script id="aiCoreCode">
 const size = 15;
 const SCORE_WIN = 10000000;
@@ -365,7 +365,7 @@ function minimax(tempBoard, depth, alpha, beta, isMaximizing, lastX, lastY, aiPl
 }
 </script>
 
-<!-- Web Worker 包裝層 -->
+<!-- ================= Web Worker 包裝層 ================= -->
 <script id="aiWorkerWrapper" type="javascript/worker">
 self.onmessage = function(e) {
     const { boardData, moves, depth, aiPlayerId, sharedBuffer } = e.data;
@@ -408,14 +408,14 @@ self.onmessage = function(e) {
     self.postMessage({ type: 'done', bestMove: bestMove, maxEval: maxEval });
 };
 </script>
-<!-- =============================================================== -->
 
+<!-- ================= 主程式 UI 與控制邏輯 ================= -->
 <script>
-// 動態載入核心函數，避免重複代碼
-eval(document.getElementById('aiCoreCode').textContent);
-
+// 初始化 UI 需要的變數
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
+const cellSize = canvas.width / size; 
+
 const statusDiv = document.getElementById('status');
 const coreInfoDiv = document.getElementById('coreInfo');
 const modeSelect = document.getElementById('modeSelect');
@@ -636,7 +636,7 @@ function triggerAIWorker() {
     totalMovesToProcess = candidates.length;
     processedMovesCount = 0;
     
-    // 合併核心邏輯與 Worker 封裝層
+    // 合併核心邏輯與 Worker 封裝層給多執行緒使用
     const fullWorkerCode = document.getElementById('aiCoreCode').textContent + "\n" + document.getElementById('aiWorkerWrapper').textContent;
     const workerBlob = new Blob([fullWorkerCode], { type: "text/javascript" });
     const workerUrl = URL.createObjectURL(workerBlob);
